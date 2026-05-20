@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""KRV Compression Tool - Adaptive Context Mixing with Online Learning"""
+
+import argparse
+import ctypes
+import os
+import sys
+import time
+
+def load_lib():
+    lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "libkrv.so")
+    if not os.path.exists(lib_path):
+        print(f"Error: {lib_path} not found. Run 'make' first.", file=sys.stderr)
+        sys.exit(1)
+    lib = ctypes.CDLL(lib_path)
+    lib.krv_compress_file.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+    lib.krv_compress_file.restype = ctypes.c_int
+    lib.krv_decompress_file.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    lib.krv_decompress_file.restype = ctypes.c_int
+    return lib
+
+def cmd_compress(args):
+    lib = load_lib()
+    in_path = args.input
+    out_path = args.output or (in_path + ".krv")
+    block_size = parse_size(args.block_size)
+
+    if not os.path.exists(in_path):
+        print(f"Error: {in_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    orig_size = os.path.getsize(in_path)
+    print(f"Compressing: {in_path} ({orig_size:,} bytes)")
+    print(f"Block size: {block_size:,} bytes")
+
+    t0 = time.time()
+    ret = lib.krv_compress_file(in_path.encode(), out_path.encode(), block_size)
+    elapsed = time.time() - t0
+
+    if ret != 0:
+        print(f"Error: compression failed (code {ret})", file=sys.stderr)
+        sys.exit(1)
+
+    comp_size = os.path.getsize(out_path)
+    ratio = comp_size / orig_size if orig_size > 0 else 0
+    speed = orig_size / elapsed / 1024 / 1024 if elapsed > 0 else 0
+
+    print(f"Output: {out_path} ({comp_size:,} bytes)")
+    print(f"Ratio: {ratio:.4f} ({(1-ratio)*100:.1f}% reduction)")
+    print(f"Time: {elapsed:.2f}s ({speed:.2f} MB/s)")
+
+def cmd_decompress(args):
+    lib = load_lib()
+    in_path = args.input
+    if args.output:
+        out_path = args.output
+    elif in_path.endswith(".krv"):
+        out_path = in_path[:-4]
+    else:
+        out_path = in_path + ".dec"
+
+    if not os.path.exists(in_path):
+        print(f"Error: {in_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    comp_size = os.path.getsize(in_path)
+    print(f"Decompressing: {in_path} ({comp_size:,} bytes)")
+
+    t0 = time.time()
+    ret = lib.krv_decompress_file(in_path.encode(), out_path.encode())
+    elapsed = time.time() - t0
+
+    if ret == -2:
+        print("Error: not a KRV file (bad magic)", file=sys.stderr)
+        sys.exit(1)
+    elif ret == -3:
+        print("Error: unsupported KRV version", file=sys.stderr)
+        sys.exit(1)
+    elif ret == -5:
+        print("Error: CRC mismatch — file corrupted", file=sys.stderr)
+        sys.exit(1)
+    elif ret != 0:
+        print(f"Error: decompression failed (code {ret})", file=sys.stderr)
+        sys.exit(1)
+
+    out_size = os.path.getsize(out_path)
+    speed = out_size / elapsed / 1024 / 1024 if elapsed > 0 else 0
+    print(f"Output: {out_path} ({out_size:,} bytes)")
+    print(f"Time: {elapsed:.2f}s ({speed:.2f} MB/s)")
+
+def cmd_info(args):
+    import struct
+    in_path = args.input
+    with open(in_path, "rb") as f:
+        magic = f.read(4)
+        if magic != b"KRV\x01":
+            print("Not a KRV file", file=sys.stderr)
+            sys.exit(1)
+        version = struct.unpack("B", f.read(1))[0]
+        flags = struct.unpack("B", f.read(1))[0]
+        orig_size = struct.unpack("<Q", f.read(8))[0]
+        block_size = struct.unpack("<I", f.read(4))[0]
+        block_count = struct.unpack("<I", f.read(4))[0]
+
+    comp_size = os.path.getsize(in_path)
+    ratio = comp_size / orig_size if orig_size > 0 else 0
+
+    print(f"File: {in_path}")
+    print(f"Version: {version}")
+    print(f"Original size: {orig_size:,} bytes")
+    print(f"Compressed size: {comp_size:,} bytes")
+    print(f"Ratio: {ratio:.4f} ({(1-ratio)*100:.1f}% reduction)")
+    print(f"Block size: {block_size:,} bytes")
+    print(f"Block count: {block_count}")
+    print(f"Checksum: {'yes' if flags & 1 else 'no'}")
+
+def parse_size(s):
+    s = s.strip().upper()
+    multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3}
+    if s[-1] in multipliers:
+        return int(float(s[:-1]) * multipliers[s[-1]])
+    return int(s)
+
+def main():
+    parser = argparse.ArgumentParser(prog="krv", description="KRV Lossless Compression")
+    sub = parser.add_subparsers(dest="command")
+
+    p_comp = sub.add_parser("compress", aliases=["c"], help="Compress a file")
+    p_comp.add_argument("input", help="Input file path")
+    p_comp.add_argument("-o", "--output", help="Output file path")
+    p_comp.add_argument("-b", "--block-size", default="4M", help="Block size (e.g. 256K, 1M)")
+
+    p_dec = sub.add_parser("decompress", aliases=["d"], help="Decompress a file")
+    p_dec.add_argument("input", help="Input .krv file path")
+    p_dec.add_argument("-o", "--output", help="Output file path")
+
+    p_info = sub.add_parser("info", aliases=["i"], help="Show archive info")
+    p_info.add_argument("input", help="Input .krv file path")
+
+    args = parser.parse_args()
+    if args.command in ("compress", "c"):
+        cmd_compress(args)
+    elif args.command in ("decompress", "d"):
+        cmd_decompress(args)
+    elif args.command in ("info", "i"):
+        cmd_info(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
