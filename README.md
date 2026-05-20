@@ -83,4 +83,4 @@ Blocks are independently decompressible.
 
 ## License
 
-All rights reserved.
+MIT
